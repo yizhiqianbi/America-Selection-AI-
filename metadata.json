@@ -1,0 +1,5 @@
+{
+  "name": "US Presidential Election Simulator",
+  "description": "A life-simulator style game where you navigate the challenges of a US presidential campaign. Create your candidate, pick unique talents, and make critical decisions as the story unfolds, powered by Gemini. Your choices determine your path to the White House or political ruin.",
+  "requestFramePermissions": []
+}
