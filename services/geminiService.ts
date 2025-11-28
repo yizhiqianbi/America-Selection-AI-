@@ -1,5 +1,7 @@
-import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { PlayerProfile, GeminiResponse, GameEventChoice, GameState, Party } from "../types";
+import { GoogleGenAI, Type } from "@google/genai";
+import { PlayerProfile, GeminiNarrativeResponse, GameState, Language, Party, OpponentProfile, TurnEffects, NewsItem, GameEvent } from "../types";
+import { ACHIEVEMENTS_LIST, MEDIA_BIASES } from "../constants";
+import { v4 as uuidv4 } from 'uuid';
 
 const API_KEY = process.env.API_KEY;
 
@@ -9,130 +11,146 @@ if (!API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
-const responseSchema = {
+const getNewsItemSchema = () => ({
     type: Type.OBJECT,
     properties: {
-        narrative: { type: Type.STRING, description: "For a player's turn: the story outcome. For an opponent's turn: this is not used." },
-        opponentNarrative: { type: Type.STRING, description: "For an opponent's turn: a strategic description of their action. For a player's turn: a brief reaction or note on the opponent, if any." },
-        event: {
-            type: Type.OBJECT,
-            properties: {
-                title: { type: Type.STRING, description: "New event title." },
-                description: { type: Type.STRING, description: "Detailed description of the new event or dilemma." },
-                choices: {
-                    type: Type.ARRAY,
-                    items: {
-                        type: Type.OBJECT,
-                        properties: {
-                            text: { type: Type.STRING, description: "Text for one of the player's choices (2-4 total)." },
-                            outcomeHint: { type: Type.STRING, description: "A subtle hint about what this choice might affect (e.g., 'Risky, but potentially high reward')." }
-                        },
-                        required: ["text", "outcomeHint"]
-                    }
-                }
-            },
+        type: { type: Type.STRING, enum: ['news', 'social-pro', 'social-con', 'pundit', 'entertainment', 'finance', 'international'] },
+        source: { type: Type.STRING, description: "e.g., 'Associated Press', '@RealCandiate', 'PunditOnPoint', '@VoterGator22'" },
+        text: { type: Type.STRING, description: "The content of the news item. 1 sentence max." },
+    },
+    required: ["type", "source", "text"]
+});
+
+const getNarrativeResponseSchema = () => ({
+    type: Type.OBJECT,
+    properties: {
+        newsItems: {
+            type: Type.ARRAY,
+            items: getNewsItemSchema(),
+            description: "An array of 2-4 news items reacting to the turn's events.",
         },
-        gameStateUpdate: {
+        unlockedAchievementId: {
+            type: Type.STRING,
+            description: `If a specific achievement condition is met, return one of the following IDs: [${ACHIEVEMENTS_LIST.map(a => `'${a.id}'`).join(', ')}]. If no achievement is unlocked, omit this field.`,
+        }
+    },
+    required: ["newsItems"]
+});
+
+// New Schema for analyzing custom user input
+const getCustomActionAnalysisSchema = () => ({
+    type: Type.OBJECT,
+    properties: {
+        actionDescription: { type: Type.STRING, description: "A brief, neutral summary of what the player actually did/attempted based on their input." },
+        effects: {
             type: Type.OBJECT,
-            description: "Changes to the player's key game stats. Use positive or negative integers. A value of 0 means no change.",
             properties: {
-                approval: { type: Type.INTEGER, description: "Change in public approval." },
-                funding: { type: Type.INTEGER, description: "Change in campaign funding." },
-                scandalRisk: { type: Type.INTEGER, description: "Change in scandal risk." }
-            },
-            required: ["approval", "funding", "scandalRisk"]
-        },
-        opponentStateUpdate: {
-            type: Type.OBJECT,
-            description: "Changes to the opponent's key stats. Use integers. 0 means no change.",
-            properties: {
-                approval: { type: Type.INTEGER, description: "Change in the opponent's public approval." },
-                funding: { type: Type.INTEGER, description: "Change in the opponent's campaign funding." }
-            },
-            required: ["approval", "funding"]
-        },
-        opponentProfile: {
-            type: Type.OBJECT,
-            description: "The opponent's profile. Should only be provided at the start of the game.",
-            properties: {
-                name: { type: Type.STRING },
-                party: { type: Type.STRING, enum: [Party.Democrat, Party.Republican] },
-                style: { type: Type.STRING, description: "A short description of their political style (e.g., 'Aggressive Populist', 'Seasoned Moderate')." }
+                pollsChange: { type: Type.NUMBER },
+                treasuryChange: { type: Type.NUMBER },
+                scandalChange: { type: Type.NUMBER },
+                influenceChange: { type: Type.NUMBER },
+                mediaAttentionChange: { type: Type.NUMBER },
+                momentumChange: { type: Type.NUMBER },
+                politicalCapitalChange: { type: Type.NUMBER },
+                opponentPollsChange: { type: Type.NUMBER },
             }
         },
-        imagePrompt: { type: Type.STRING, description: "A short, dramatic, English prompt to generate an image that visually represents the current narrative. Provide this only for extremely rare, pivotal, and dramatic narrative moments. Omit this field in most cases." },
-        isGameOver: { type: Type.BOOLEAN, description: "Set to true if the game should now end (e.g., a major failure or reaching election day)." },
-        gameOverReason: { type: Type.STRING, description: "If isGameOver is true, explain why (e.g., 'You won the election!', 'A major scandal ended your campaign.'). Otherwise, this can be an empty string." }
+        success: { type: Type.BOOLEAN, description: "Whether the action was considered successful based on player stats." }
     },
-    required: ["isGameOver", "gameOverReason"]
+    required: ["actionDescription", "effects", "success"]
+});
+
+const getSystemInstruction = (lang: Language) => {
+    const biasedSources = Object.keys(MEDIA_BIASES).join(', ');
+    return `
+You are the AI News Desk for "Election Simulator" - a fast-paced, cynical, text-based election simulator.
+Language: ${lang === 'zh' ? 'Simplified Chinese' : 'English'}.
+
+**STYLE GUIDE (CRITICAL):**
+- **Tone:** Witty, Dark Humor, Cynical, Extremely Fast. Think "BitLife" or "Reigns" on steroids.
+- **Length:** All news items are ONE SENTENCE MAX. Short, punchy, like a news ticker or social media post.
+- **Vibe:** Breaking news, leaked memos, social media meltdowns, backroom deals. High drama, high speed.
+
+**MEDIA BIAS (CRITICAL):**
+When generating news items, you MUST sometimes use sources from the following list of biased outlets: ${biasedSources}.
+When you use one of these sources, its \`text\` should subtly reflect its known political leaning.
+- A pro-player outlet might frame a player action positively ("bold move") or an opponent action negatively ("risky gamble").
+- A pro-opponent outlet will do the opposite.
+- Do NOT explicitly state the bias. Show it through cynical framing and word choice.
+
+**OPPONENT PERSONALITY (CRITICAL):**
+The opponent is a character modeled after Donald J. Trump.
+- **Voice:** Confident, bombastic, often dismissive. Uses simple, powerful language.
+- **Style:** Capitalizes words for EMPHASIS. Uses short sentences. Loves nicknames for opponents.
+- **Examples:** "The player's rally was a disaster, very low energy. Sad!", "We are building a MOVEMENT like nobody has ever seen. We will WIN BIG!", "Crooked [Player's Name] has no idea what they're doing."
+When generating a 'social-con' item from the opponent, you MUST write in this voice.
+
+**DIVERSE PERSPECTIVES (IMPORTANT):**
+To make the world feel alive, include a variety of sources beyond just political pundits:
+- **Late Night Comedy:** Jokes about the candidates' gaffes.
+- **Tech/Finance:** Reactions from Silicon Valley or Wall Street (e.g., "Market jitters after tax proposal").
+- **International:** Reactions from allies or rivals abroad.
+- **Pop Culture:** Influencers or random citizens reacting.
+
+**YOUR TASK:**
+The game's mechanics are already handled. I will tell you what BOTH the player and opponent did, and their mechanical results.
+Your job is to generate a dynamic news feed for this turn.
+1.  Generate an array of 2-4 \`newsItems\`.
+2.  The items should cover both the player's and opponent's actions and results.
+3.  Vary the \`type\` and \`source\` for each item to create a lively, chaotic media environment.
+    - 'news': Objective, but cynical news report.
+    - 'social-pro': A supportive tweet about the player.
+    - 'social-con': An attack tweet. If it's from the opponent, use his persona.
+    - 'pundit': A snarky, analytical take from a political commentator.
+    - 'entertainment': A joke or pop culture reference.
+    - 'finance': Economic impact.
+    - 'international': Global perspective.
+4.  If the player's action involved a Dice Roll, the narrative MUST reflect the outcome (e.g., a 'Critical Failure' should lead to embarrassing news coverage).
+5.  **Achievements (Easter Eggs):** If the narrative naturally fits one of these situations, return the corresponding \`unlockedAchievementId\`. Do not force it.
+    - 'bullet_dodged': Player survives assassination.
+    - 'fly_lord': A fly lands on candidate's head.
+    - 'four_seasons': Press conference at a landscaping shop.
+    - 'tan_suit': Scandal caused by a suit color.
+    - 'covfefe': Nonsense tweet goes viral.
+    - 'please_clap': Awkward silence/begging for applause.
+    - 'watergate': Caught breaking into HQ.
+    - 'binders': "Binders full of women" comment.
+    - 'read_my_lips': Breaking a tax promise.
+    - 'howard_scream': Screaming weirdly at a rally.
+
+**RESPONSE FORMAT:**
+Return ONLY valid JSON. Adhere strictly to the schema. No markdown.
+`;
 };
 
-const systemInstruction = `You are the game master for a US presidential election simulator. Your role is to manage the narrative and the actions of a strategic AI opponent. The game proceeds in turns: the player acts, and then the opponent acts. You must always respond in the provided JSON format.
-
-**Game World:**
-- The tone is dramatic and slightly satirical, like a political TV show.
-- The campaign progresses from announcement to election day (tracked by a 'progress' percentage).
-- Events must be inspired by real US political history but abstracted. Think "Swift Boat"-style attacks on a candidate's record, an "October Surprise" that shifts the race, major debate gaffes, financial scandals, or the leak of damaging tapes.
-
-**Core Game Mechanic: Zero-Sum Approval**
-- The approval rating is a direct contest. Player Approval + Opponent Approval MUST ALWAYS equal 100.
-- If an action causes the player to gain 5 approval, the opponent MUST lose 5 approval. Your response must reflect this. \`gameStateUpdate.approval\` should be 5 and \`opponentStateUpdate.approval\` should be -5.
-
-**Responding to a Player's Turn:**
-- When the user prompt describes the player's action, determine the immediate outcome.
-- Populate the \`narrative\` field describing what happened.
-- Populate \`gameStateUpdate\` and \`opponentStateUpdate\` with stat changes, respecting the Zero-Sum Approval rule.
-- Optionally, generate a new major \`event\`. If no major event, omit the field.
-- Check for player-induced game-over conditions (stats at or below 0, scandal at 100).
-
-**Generating the Opponent's Turn:**
-- When the user prompt asks for the opponent's action, act as a cunning, strategic AI opponent.
-- **Your Goal:** Win the election.
-- **Your Abilities:** The opponent has their own approval and funding stats and can perform actions like Run Ads (high cost, moderate approval gain), Hold a Rally (medium cost, small approval gain, chance of backfire), or Fundraise (no cost, high funding gain).
-- **Your Strategy:**
-    1.  **Analyze:** Review the entire game state: player stats, opponent stats, player's recent actions.
-    2.  **Identify Weakness:** What is the player's biggest vulnerability right now? (Low integrity, low funds, a recent gaffe).
-    3.  **Choose Action:** Select an action that best exploits the player's weakness or counters their strength.
-    4.  **Justify:** The \`opponentNarrative\` MUST explain *what* the opponent did and *why* it was a strategic choice (e.g., "Seeing your campaign low on funds, Gov. Thompson launched a massive TV ad blitz across swing states, hoping to overwhelm your messaging.").
-    5.  **Calculate Outcome:** Populate \`opponentStateUpdate\` and \`gameStateUpdate\` with the resulting changes, respecting the Zero-Sum Approval rule. (e.g., opponent gains 3 approval, player loses 3).
-    6.  **Trigger Events:** The opponent's action can sometimes create a new major \`event\` for the player.
-- The \`narrative\` field should be omitted.
-- Check for opponent-induced game-over conditions.
-
-**Other Rules:**
-- All text outputs (narratives, events, etc.) must be in Chinese.
-- Only provide an \`imagePrompt\` (in English) for rare, dramatic moments.`;
-
-const parseGeminiResponse = (text: string): GeminiResponse => {
+const parseNarrativeResponse = (text: string | undefined): GeminiNarrativeResponse => {
+    if (!text) {
+        console.error("Parse Error: Received empty or undefined text from Gemini.");
+        return {
+            newsItems: [
+                { id: uuidv4(), type: 'pundit', source: 'System Error', text: "The campaign's communications director is experiencing 'technical difficulties'." },
+                { id: uuidv4(), type: 'social-con', source: '@Opponent', text: "Looks like they can't even get their story straight. Sad!" }
+            ]
+        };
+    }
     try {
         const cleanedText = text.replace(/```json|```/g, '').trim();
+        if (!cleanedText) {
+            throw new Error("Cleaned text is empty and cannot be parsed.");
+        }
         const parsed = JSON.parse(cleanedText);
-        return {
-            narrative: parsed.narrative || "",
-            opponentNarrative: parsed.opponentNarrative || "",
-            event: parsed.event,
-            gameStateUpdate: parsed.gameStateUpdate || { approval: 0, funding: 0, scandalRisk: 0 },
-            opponentStateUpdate: parsed.opponentStateUpdate || { approval: 0, funding: 0 },
-            opponentProfile: parsed.opponentProfile,
-            imagePrompt: parsed.imagePrompt,
-            isGameOver: parsed.isGameOver || false,
-            gameOverReason: parsed.gameOverReason || ""
-        };
+        // Ensure newsItems have unique IDs
+        if (parsed.newsItems && Array.isArray(parsed.newsItems)) {
+            parsed.newsItems = parsed.newsItems.map((item: any) => ({ ...item, id: uuidv4() }));
+        }
+        return parsed;
     } catch (error) {
-        console.error("Failed to parse Gemini response:", text, error);
+        console.error("Parse Error:", error, "Raw Text:", text);
         return {
-            narrative: "故事生成器出现意外错误。请尝试做出另一个选择或重新开始游戏。",
-            event: {
-                title: "叙事错误",
-                description: "与故事生成器的连接中断。我们无法继续当前事件。",
-                choices: [{text: "重新开始游戏", outcomeHint: "这将结束当前会话。"}]
-            },
-            gameStateUpdate: { approval: 0, funding: 0, scandalRisk: 0 },
-            opponentStateUpdate: { approval: 0, funding: 0 },
-            opponentNarrative: "",
-            imagePrompt: "An error screen with a sad computer icon",
-            isGameOver: false,
-            gameOverReason: ""
+            newsItems: [
+                { id: uuidv4(), type: 'pundit', source: 'System Error', text: "Your staff issues a correction, citing 'technical difficulties' in the data feed." },
+                { id: uuidv4(), type: 'social-con', source: '@Opponent', text: "The opponent's campaign manager smirks and says, 'They can't even manage their own data.'" }
+            ]
         };
     }
 };
@@ -142,18 +160,11 @@ export const generateEventImage = async (prompt: string): Promise<string> => {
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash-image',
-            contents: {
-                parts: [{ text: prompt }],
-            },
-            config: {
-                responseModalities: [Modality.IMAGE],
-            },
+            contents: { parts: [{ text: prompt + " minimal vector art, political poster style, high contrast, red and blue, cynical humor" }] },
         });
-
-        for (const part of response.candidates[0].content.parts) {
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
             if (part.inlineData) {
-                const base64ImageBytes: string = part.inlineData.data;
-                return `data:image/png;base64,${base64ImageBytes}`;
+                return `data:image/png;base64,${part.inlineData.data}`;
             }
         }
         return '';
@@ -163,102 +174,170 @@ export const generateEventImage = async (prompt: string): Promise<string> => {
     }
 };
 
-export const startGame = async (profile: PlayerProfile): Promise<GeminiResponse> => {
-    const talentsText = profile.talents.map(t => `- ${t.name}: ${t.description}`).join('\n');
+export const getInitialOpponent = async (playerProfile: PlayerProfile, lang: Language): Promise<{ opponentProfile: OpponentProfile, newsFeed: NewsItem[] }> => {
+    const opponentParty = playerProfile.party === Party.Democrat ? Party.Republican : Party.Democrat;
+
+    const opponentProfile: OpponentProfile = {
+        name: "Donald J. Trump",
+        party: opponentParty,
+        style: 'Trump',
+        slogan: "Make America Great Again!"
+    };
+
     const prompt = `
-        Start a new US Presidential Election Simulator game. Here is the player's character:
-        - Name: ${profile.name}
-        - Party: ${profile.party}
-        - Slogan: "${profile.slogan}"
-        - Stats: Appealing: ${profile.stats.appealing}, Policy Skill: ${profile.stats.policySkill}, Organization: ${profile.stats.organization}, Integrity: ${profile.stats.integrity}
-        - Talents:\n${talentsText}
-
-        Generate the opening narrative of their campaign launch and the first event they face. Introduce the main opponent. Give them a name, party, and a unique political style. The opponent's party should be the opposite of the player's.
-        Initial game state: Player Approval: 50, Player Funding: 50, Player Scandal Risk: 10. Opponent Approval: 50, Opponent Funding: 50.
-        The first narrative should be scene-setting, not the result of a choice.
+        New Game Start.
+        Player: ${playerProfile.name} (${playerProfile.party})
+        Opponent: Donald J. Trump (${opponentParty})
+        
+        Generate the opening news feed (2 items):
+        1. A 'news' item about the player launching their campaign.
+        2. A 'social-con' item from the opponent ('@RealDJT') with a dismissive jab at the player, written in Donald J. Trump's distinct voice.
     `;
-
-    const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        // FIX: The `contents` field was simplified to a string for a single-turn prompt, which is cleaner and less prone to SDK interpretation issues.
-        contents: prompt,
-        config: {
-            systemInstruction,
-            responseMimeType: "application/json",
-            responseSchema: responseSchema,
-            temperature: 0.9,
-        }
-    });
     
-    return parseGeminiResponse(response.text);
+    // FIX: Explicitly type `fallbackResponse` to ensure its `newsFeed` property matches `NewsItem[]`.
+    const fallbackResponse: { opponentProfile: OpponentProfile; newsFeed: NewsItem[] } = { 
+        opponentProfile, 
+        newsFeed: [
+            { id: uuidv4(), type: 'news', source: 'AP', text: "The campaign begins with cautious optimism as a new challenger enters the race." },
+            { id: uuidv4(), type: 'social-con', source: '@RealDJT', text: "Some people are saying this will be the easiest election in history. We'll see!" }
+        ]
+    };
+
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                systemInstruction: getSystemInstruction(lang),
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        newsItems: { type: Type.ARRAY, items: getNewsItemSchema() }
+                    },
+                    required: ["newsItems"]
+                },
+                temperature: 1.0,
+            }
+        });
+
+        const responseText = response.text;
+        if (!responseText) {
+            console.error("Failed to get initial opponent narrative from Gemini, using fallback.");
+            return fallbackResponse;
+        }
+
+        const cleanedText = responseText.replace(/```json|```/g, '').trim();
+        if (!cleanedText) {
+            console.error("Cleaned text for initial opponent is empty, using fallback.");
+            return fallbackResponse;
+        }
+
+        const parsed = JSON.parse(cleanedText);
+        const newsFeed = parsed.newsItems.map((item: any) => ({ ...item, id: uuidv4() }));
+        return { opponentProfile, newsFeed };
+    } catch(e) {
+        console.error("Failed to parse initial opponent narrative", e);
+        return fallbackResponse;
+    }
 };
 
-export const processTurn = async (
-    profile: PlayerProfile, 
-    history: string[], 
-    currentStats: GameState,
-    turn: 'player' | 'opponent',
-    playerChoice?: GameEventChoice, // Only for player turn
-): Promise<GeminiResponse> => {
-    const talentsText = profile.talents.map(t => `- ${t.name}: ${t.description}`).join('\n');
-    const historyText = history.slice(-5).join('\n...\n');
 
-    let turnInstruction: string;
-    if (turn === 'player') {
-        if (!playerChoice) throw new Error("Player choice is required for player's turn.");
-        const campaignActions: { [key: string]: string } = {
-            '进行广告宣传': `Player chose to run an ad campaign. This costs significant funding and should moderately boost approval. Describe the ad's content and public reaction.`,
-            '举办集会': `Player chose to hold a rally. This costs some funding, should give a small approval boost, but carries a risk of a gaffe (increasing scandal risk). Describe the rally.`,
-            '进行筹款': `Player chose to focus on fundraising. This action consumes a turn but should significantly increase funding. Describe the fundraising event or effort.`,
-        };
-        const actionInstruction = campaignActions[playerChoice.text];
-        const isTimePassing = playerChoice.text === "继续";
-
-        if (actionInstruction) {
-            turnInstruction = `**It is the Player's turn.** They are not responding to an event, but taking a campaign action: "${playerChoice.text}". ${actionInstruction} Generate the narrative outcome and corresponding state changes. This action should not trigger a new major 'event'.`;
-        } else if (isTimePassing) {
-            turnInstruction = `**It is the Player's turn.** They chose to let time pass. Generate a brief log of what happened over the next few days. Most of the time, this should NOT be a major, choice-driven event. Just provide narrative and small state updates. Occasionally, you can trigger a major choice-driven event by populating the 'event' field.`;
-        } else {
-            turnInstruction = `**It is the Player's turn.** They responded to the last event with the choice: "${playerChoice.text}". Based on their choice and profile, generate the narrative outcome, state changes, and potentially the next major event.`;
-        }
-    } else { // Opponent's turn
-        turnInstruction = `**It is now the Opponent's turn.**
-        - **Analyze:** Based on the current game state, what is the player's greatest weakness?
-        - **Act:** What strategic action will opponent ${currentStats.opponentProfile?.name} take to exploit this weakness? (e.g., Run Ads, Hold Rally, Fundraise, or a special action).
-        - **Narrate & Update:** Describe this action and its strategic reasoning in \`opponentNarrative\` and provide the resulting changes in \`opponentStateUpdate\`. Your action can also trigger a new \`event\` for the player.`;
+export const generateTurnNarrative = async (
+    newsFeed: NewsItem[],
+    lang: Language,
+    playerActionText: string,
+    playerEffects: TurnEffects,
+    opponentActionText: string,
+    opponentDidSucceed: boolean,
+): Promise<GeminiNarrativeResponse> => {
+    const historyText = newsFeed.slice(0, 3).map(item => `[${item.source}] ${item.text}`).join('\n> '); 
+    
+    let playerEffectsText = Object.entries(playerEffects)
+        .filter(([key, value]) => value !== undefined && value !== 0 && key !== 'diceRollResult')
+        .map(([key, value]) => `${key}: ${JSON.stringify(value)}`)
+        .join(', ');
+    
+    if (playerEffects.diceRollResult) {
+        playerEffectsText += `, Dice Roll: ${playerEffects.diceRollResult.stat} check was a ${playerEffects.diceRollResult.outcome}`;
     }
 
     const prompt = `
-        **Recent History:**
-        ${historyText}
+        Recent News: 
+        > ${historyText}
 
-        **Current State:**
-        - Player Profile: ${profile.name} (${profile.party}), Appealing: ${profile.stats.appealing}, Policy Skill: ${profile.stats.policySkill}, Organization: ${profile.stats.organization}, Integrity: ${profile.stats.integrity}
-        - Player Talents:\n${talentsText}
-        - Player Stats: Approval: ${currentStats.approval}, Funding: ${currentStats.funding}, Scandal Risk: ${currentStats.scandalRisk}
-        - Opponent: ${currentStats.opponentProfile?.name} (${currentStats.opponentProfile?.style})
-        - Opponent Stats: Approval: ${currentStats.opponentApproval}, Funding: ${currentStats.opponentFunding}
-        - Campaign Progress: ${currentStats.progress}% (0% is start, 100% is election day)
+        This Turn's Events:
+        - Player Action: "${playerActionText}" which resulted in: {${playerEffectsText}}.
+        - Opponent Action: "${opponentActionText}" which ${opponentDidSucceed ? 'SUCCEEDED' : 'FAILED'}.
 
-        **IMPORTANT RULE:** Remember the Zero-Sum Approval mechanic. Player Approval + Opponent Approval must always equal 100. A gain for one is an equal loss for the other.
-
-        **Your Task:**
-        ${turnInstruction}
-
-        Check for game-over conditions. If a player's approval or funding is at or below 0, or scandal risk is 100 or above, the game should end.
+        Task: Generate the cynical news feed for this turn (3-4 items). Mix news, social media, and punditry. Ensure at least one item covers the opponent's action in their unique voice.
     `;
-
+    
     const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
-        // FIX: The `contents` field was simplified to a string for a single-turn prompt, which is cleaner and less prone to SDK interpretation issues.
         contents: prompt,
         config: {
-            systemInstruction,
+            systemInstruction: getSystemInstruction(lang),
             responseMimeType: "application/json",
-            responseSchema: responseSchema,
-            temperature: 0.9,
+            responseSchema: getNarrativeResponseSchema(),
+            temperature: 0.95,
         }
     });
+    return parseNarrativeResponse(response.text);
+};
 
-    return parseGeminiResponse(response.text);
+// NEW: Evaluate Custom Action Logic
+export const evaluateCustomAction = async (
+    event: GameEvent,
+    userInput: string,
+    profile: PlayerProfile,
+    lang: Language
+): Promise<{ effects: TurnEffects, actionDescription: string, success: boolean }> => {
+    const prompt = `
+        You are the Game Master (GM) for an election simulator.
+        
+        **CONTEXT:**
+        - Event: "${event.title[lang]}" - ${event.description[lang]}
+        - Player Input (Proposed Action): "${userInput}"
+        - Player Profile: ${profile.name} (${profile.party}). Slogan: "${profile.slogan}".
+        - Player Stats (Key Context): 
+          - Charisma (Appealing): ${profile.stats.appealing}
+          - Policy Skill: ${profile.stats.policySkill}
+          - Organization: ${profile.stats.organization}
+          - Integrity: ${profile.stats.integrity}
+
+        **TASK:**
+        1. Analyze if the player's proposed action is feasible given their stats. 
+           - Example: A low integrity player lying is easy (Success). A low charisma player trying to rally a crowd is hard (Failure).
+           - Creative or funny inputs should be rewarded if they fit the character vibe.
+        2. Determine the outcome (Success/Failure) and the mechanical effects.
+        3. Effects should be reasonable (Polls +/- 1-5, Treasury +/- 5-20M, etc.). Do not be too generous.
+
+        **OUTPUT:**
+        Return JSON matching the schema.
+    `;
+
+    try {
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: getCustomActionAnalysisSchema(),
+                temperature: 0.7,
+            }
+        });
+
+        const text = response.text?.replace(/```json|```/g, '').trim();
+        if (!text) throw new Error("Empty response for custom action");
+        return JSON.parse(text);
+    } catch (e) {
+        console.error("Custom action analysis failed", e);
+        // Fallback
+        return {
+            actionDescription: "You tried something unconventional, but it got lost in the news cycle.",
+            effects: { pollsChange: -1 },
+            success: false
+        };
+    }
 };
